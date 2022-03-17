@@ -23,33 +23,40 @@ class LiteEthMACSRAMWriter(Module, AutoCSR):
         self.crc_error = Signal()
 
         # Parameters Check / Compute.
-        assert dw in [8, 16, 32, 64]
+        assert dw in [8, 16, 32, 64, 128]
         slotbits   = max(int(math.log2(nslots)), 1)
         lengthbits = bits_for(depth * dw//8)
+
+        # Event Manager.
+        self.submodules.ev = EventManager()
+        self.ev.available = EventSourceLevel()
+        self.ev.finalize()
 
         # CSRs.
         self._slot   = CSRStatus(slotbits)
         self._length = CSRStatus(lengthbits)
         self._errors = CSRStatus(32)
-
-        # Optional Timestamp of the incoming packets and expose value to software.
-        if timestamp is not None:
-            timestampbits   = len(timestamp)
-            self._timestamp = CSRStatus(timestampbits)
-
-        # Event Manager.
-        self.submodules.ev = EventManager()
-        self.ev.available  = EventSourceLevel()
-        self.ev.finalize()
-
+        self._enable   = CSRStorage(reset=0)
+        self._discard   = CSRStatus(32,reset=0)
+        self.start_transfer   = Signal(reset=0)
+        self.transfer_ready   = Signal(reset=0)
+        self.test1 = CSRStatus(32,reset=0)
+        self.test2 = CSRStatus(32,reset=0)
+        self.test3 = CSRStatus(32,reset=0)
+        self._pending_slots = CSRStatus(nslots,reset=0)
+        self._clear_pending = CSRStorage(nslots,reset=0)
+        self._pending_length = CSRStatus(32*nslots,reset=0)
         # # #
+        self.pcie_irq = Signal()
+        stat_fifo_valid_tmp = Signal()
 
+        self.pcie_slot = Signal(32,reset=0)
         write   = Signal()
         errors  = self._errors.status
 
         slot       = Signal(slotbits)
         length     = Signal(lengthbits)
-        length_inc = Signal(4)
+        length_inc = Signal(32)
 
         # Sink is already ready: packets are dropped when no slot is available.
         sink.ready.reset = 1
@@ -63,19 +70,25 @@ class LiteEthMACSRAMWriter(Module, AutoCSR):
             0b00010000 : length_inc.eq(5),
             0b00100000 : length_inc.eq(6),
             0b01000000 : length_inc.eq(7),
+            0b010000000: length_inc.eq(8),
+            0b0100000000: length_inc.eq(9),
+            0b01000000000: length_inc.eq(10),
+            0b010000000000: length_inc.eq(11),
+            0b0100000000000: length_inc.eq(12),
+            0b01000000000000: length_inc.eq(13),
+            0b010000000000000: length_inc.eq(14),
+            0b0100000000000000: length_inc.eq(15),
             "default"  : length_inc.eq(dw//8)
         })
 
         # Status FIFO.
         stat_fifo_layout = [("slot", slotbits), ("length", lengthbits)]
-        if timestamp is not None:
-            stat_fifo_layout += [("timestamp", timestampbits)]
         self.submodules.stat_fifo = stat_fifo = stream.SyncFIFO(stat_fifo_layout, nslots)
 
         # FSM.
         self.submodules.fsm = fsm = FSM(reset_state="WRITE")
         fsm.act("WRITE",
-            If(sink.valid,
+            If(sink.valid & self._enable.storage,
                 If(stat_fifo.sink.ready,
                     write.eq(1),
                     NextValue(length, length + length_inc),
@@ -98,7 +111,8 @@ class LiteEthMACSRAMWriter(Module, AutoCSR):
         fsm.act("DISCARD-REMAINING",
             If(sink.valid & sink.last,
                 If((sink.error & sink.last_be) != 0,
-                    NextState("DISCARD")
+                    NextState("DISCARD"),
+                    NextValue(self._discard.status,self._discard.status+1)
                 ).Else(
                     NextState("TERMINATE")
                 )
@@ -118,16 +132,49 @@ class LiteEthMACSRAMWriter(Module, AutoCSR):
         )
 
         self.comb += [
-            stat_fifo.source.ready.eq(self.ev.available.clear),
-            self.ev.available.trigger.eq(stat_fifo.source.valid),
             self._slot.status.eq(stat_fifo.source.slot),
             self._length.status.eq(stat_fifo.source.length),
+            self.test3.status.eq(stat_fifo.level)
         ]
-        if timestamp is not None:
-            # Latch Timestamp on start of packet.
-            self.sync += If(length == 0, stat_fifo.sink.timestamp.eq(timestamp))
-            self.comb += self._timestamp.status.eq(stat_fifo.source.timestamp)
 
+        self.sync += [
+            If(stat_fifo.source.valid,self.test1.status.eq(self.test1.status+1)),
+            If(self.pcie_irq, self.test2.status.eq(self.test2.status + 1))
+        ]
+        self.submodules.irq_fsm = irq_fsm = FSM(reset_state="IDLE")
+
+        self.comb += self.pcie_slot.eq(0xffffffff),
+        for i in reversed(range(nslots)): # Priority given to lower indexes.
+            self.comb += If(self._pending_slots.status[i] == 0, self.pcie_slot.eq(i))
+
+        clear_pending = Signal(32,reset=0)
+        new_pending_slots = Signal(32,reset=0)
+        pending_length = Array(Signal(32,reset=0) for i in range(nslots))
+        for i in range(nslots):
+            self.comb += [
+                self._pending_length.status[i*32:(i+1)*32].eq(pending_length[nslots-i-1]),
+            ]
+
+        self.comb += [If(self._clear_pending.re, clear_pending.eq(self._clear_pending.storage)),
+                      If(self.start_transfer,
+                         new_pending_slots.eq(1 << self.pcie_slot))]
+
+        self.sync += self._pending_slots.status.eq((self._pending_slots.status & ~clear_pending) | new_pending_slots)
+
+        irq_fsm.act("IDLE",
+                If(stat_fifo.source.valid & (self.pcie_slot != 0xffffffff),
+                   NextValue(pending_length[self.pcie_slot],stat_fifo.source.length),
+                   NextState("TRANSFER")),
+        )
+        irq_fsm.act("TRANSFER",
+                self.start_transfer.eq(1), NextState("WAIT_TRANSFER"),
+        )
+        irq_fsm.act("WAIT_TRANSFER",
+                If(self.transfer_ready, 
+                   self.pcie_irq.eq(1), 
+                   stat_fifo.source.ready.eq(1), 
+                   NextState("IDLE")),
+        )
         # Memory.
         wr_slot = slot
         wr_addr = length[int(math.log2(dw//8)):]
@@ -165,9 +212,13 @@ class LiteEthMACSRAMReader(Module, AutoCSR):
         self.source = source = stream.Endpoint(eth_phy_description(dw))
 
         # Parameters Check / Compute.
-        assert dw in [8, 16, 32, 64]
+        assert dw in [8, 16, 32, 64, 128]
         slotbits   = max(int(math.log2(nslots)), 1)
         lengthbits = bits_for(depth * dw//8)
+        # Event Manager.
+        self.submodules.ev = EventManager()
+        self.ev.done = EventSourcePulse() if timestamp is None else EventSourceLevel()
+        self.ev.finalize()
 
         # CSRs.
         self._start  = CSR()
@@ -175,25 +226,15 @@ class LiteEthMACSRAMReader(Module, AutoCSR):
         self._level  = CSRStatus(int(math.log2(nslots)) + 1)
         self._slot   = CSRStorage(slotbits,   reset_less=True)
         self._length = CSRStorage(lengthbits, reset_less=True)
-
-        # Optional Timestamp of the outgoing packets and expose value to software.
-        if timestamp is not None:
-            timestampbits        = len(timestamp)
-            self._timestamp_slot = CSRStatus(slotbits)
-            self._timestamp      = CSRStatus(timestampbits)
-
-        # Event Manager.
-        self.submodules.ev = EventManager()
-        self.ev.done       = EventSourcePulse() if timestamp is None else EventSourceLevel()
-        self.ev.finalize()
-
+        self.start_transfer   = Signal(reset=0)
+        self.transfer_ready   = Signal(reset=0)
         # # #
-
+        self.pcie_irq = Signal()
         read   = Signal()
         length = Signal(lengthbits)
 
         # Command FIFO.
-        cmd_fifo = stream.SyncFIFO([("slot", slotbits), ("length", lengthbits)], nslots)
+        self.cmd_fifo = cmd_fifo = stream.SyncFIFO([("slot", slotbits), ("length", lengthbits)], nslots)
         self.submodules += cmd_fifo
         self.comb += [
             cmd_fifo.sink.valid.eq(self._start.re),
@@ -202,15 +243,6 @@ class LiteEthMACSRAMReader(Module, AutoCSR):
             self._ready.status.eq(cmd_fifo.sink.ready),
             self._level.status.eq(cmd_fifo.level)
         ]
-
-        # Status FIFO (Only added when Timestamping).
-        if timestamp is not None:
-            stat_fifo_layout = [("slot", slotbits), ("timestamp", timestampbits)]
-            stat_fifo = stream.SyncFIFO(stat_fifo_layout, nslots)
-            self.submodules += stat_fifo
-            self.comb += stat_fifo.source.ready.eq(self.ev.done.clear)
-            self.comb += self._timestamp_slot.status.eq(stat_fifo.source.slot)
-            self.comb += self._timestamp.status.eq(stat_fifo.source.timestamp)
 
         # Encode Length to last_be.
         length_lsb = cmd_fifo.source.length[:int(math.log2(dw/8))] if (dw != 8) else 0
@@ -223,6 +255,14 @@ class LiteEthMACSRAMReader(Module, AutoCSR):
                 5         : source.last_be.eq(0b00010000),
                 6         : source.last_be.eq(0b00100000),
                 7         : source.last_be.eq(0b01000000),
+                8: source.last_be.eq(0b010000000),
+                9: source.last_be.eq(0b0100000000),
+                10: source.last_be.eq(0b01000000000),
+                11: source.last_be.eq(0b010000000000),
+                12: source.last_be.eq(0b0100000000000),
+                13: source.last_be.eq(0b01000000000000),
+                14: source.last_be.eq(0b010000000000000),
+                15: source.last_be.eq(0b0100000000000000),
                 "default" : source.last_be.eq(2**(dw//8 - 1)),
             })
         )
@@ -231,6 +271,12 @@ class LiteEthMACSRAMReader(Module, AutoCSR):
         self.submodules.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(cmd_fifo.source.valid,
+               self.start_transfer.eq(1),
+               NextState("WAIT_PCIE"),
+            )
+        )
+        fsm.act("WAIT_PCIE",
+            If(self.transfer_ready,
                 read.eq(1),
                 NextValue(length, dw//8),
                 NextState("READ")
@@ -249,18 +295,10 @@ class LiteEthMACSRAMReader(Module, AutoCSR):
         )
         fsm.act("TERMINATE",
             NextValue(length, 0),
-            self.ev.done.trigger.eq(1),
+            self.pcie_irq.eq(1),
             cmd_fifo.source.ready.eq(1),
             NextState("IDLE")
         )
-
-        if timestamp is not None:
-            # Latch Timestamp on start of outgoing packet.
-            self.sync += If(length == 0, stat_fifo.sink.timestamp.eq(timestamp))
-            self.comb += stat_fifo.sink.valid.eq(fsm.ongoing("END"))
-            self.comb += stat_fifo.sink.slot.eq(cmd_fifo.source.slot)
-            # Trigger event when Status FIFO has contents (Override FSM assignment).
-            self.comb += self.ev.done.trigger.eq(stat_fifo.source.valid)
 
         # Memory.
         rd_slot = cmd_fifo.source.slot
@@ -292,7 +330,8 @@ class LiteEthMACSRAMReader(Module, AutoCSR):
 
 class LiteEthMACSRAM(Module, AutoCSR):
     def __init__(self, dw, depth, nrxslots, ntxslots, endianness, timestamp=None):
-        self.submodules.writer = LiteEthMACSRAMWriter(dw, depth, nrxslots, endianness, timestamp)
-        self.submodules.reader = LiteEthMACSRAMReader(dw, depth, ntxslots, endianness, timestamp)
-        self.submodules.ev     = SharedIRQ(self.writer.ev, self.reader.ev)
+        self.submodules.writer = LiteEthMACSRAMWriter(dw, depth, nrxslots, endianness, timestamp) # RX
+        self.submodules.reader = LiteEthMACSRAMReader(dw, depth, ntxslots, endianness, timestamp) # TX
         self.sink, self.source = self.writer.sink, self.reader.source
+        self.rx_pcie_irq = self.writer.pcie_irq
+        self.tx_pcie_irq = self.reader.pcie_irq
